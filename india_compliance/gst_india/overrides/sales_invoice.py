@@ -1,6 +1,7 @@
 import frappe
 from frappe import _, bold
-from frappe.utils import flt, fmt_money
+from frappe.desk.form.load import run_onload
+from frappe.utils import add_days, flt, fmt_money, get_datetime
 
 from india_compliance.gst_india.overrides.payment_entry import get_taxes_summary
 from india_compliance.gst_india.overrides.transaction import (
@@ -21,10 +22,15 @@ from india_compliance.gst_india.utils import (
     validate_invoice_number,
 )
 from india_compliance.gst_india.utils.e_invoice import (
+    _cancel_e_invoice,
     get_e_invoice_info,
     validate_e_invoice_applicability,
+    validate_if_e_invoice_can_be_cancelled,
 )
-from india_compliance.gst_india.utils.e_waybill import get_e_waybill_info
+from india_compliance.gst_india.utils.e_waybill import (
+    _cancel_e_waybill,
+    get_e_waybill_info,
+)
 from india_compliance.gst_india.utils.transaction_data import (
     validate_unique_hsn_and_uom,
 )
@@ -143,8 +149,13 @@ def is_shipping_address_in_india(doc):
 
 
 def on_submit(doc, method=None):
+    # Check to validate_backdated_transaction
+    if ignore_gst_validations(doc):
+        return
+
     validate_backdated_transaction(doc)
 
+    # Checks to validate generation of e-Invoice
     if getattr(doc, "_submitted_from_ui", None) or validate_transaction(doc) is False:
         return
 
@@ -182,6 +193,10 @@ def on_submit(doc, method=None):
 
 
 def before_cancel(doc, method=None):
+    run_onload(doc)  # Load e-Waybill and e-Invoice info
+    validate_cancellation_based_on_e_invoice(doc)
+    cancel_e_waybill_e_invoice(doc)
+
     if ignore_gst_validations(doc):
         return
 
@@ -204,6 +219,67 @@ def before_cancel(doc, method=None):
         reverse_gst_adjusted_against_payment_entry(
             reference.voucher_detail_no, reference.payment_name
         )
+
+
+def validate_cancellation_based_on_e_invoice(doc):
+    if not doc.irn:
+        return
+
+    cannot_be_cancelled = (
+        validate_if_e_invoice_can_be_cancelled(doc, throw=False) is False
+    )
+    restrict_cancel = frappe.db.get_single_value(
+        "GST Settings", "restrict_cancel_if_e_invoice_final"
+    )
+
+    if cannot_be_cancelled and restrict_cancel:
+        frappe.throw(
+            _(
+                "This document cannot be cancelled because the associated e-Invoice is not cancellable. <br><br>Please create a Credit Note instead."
+            )
+        )
+
+
+def cancel_e_waybill_e_invoice(doc, method=None):
+    gst_settings = frappe.get_cached_doc("GST Settings")
+
+    if not is_api_enabled(gst_settings):
+        return
+
+    def auto_cancel(cancel_func, action_type):
+        if action_type == "e_invoice":
+            generated_on = (
+                doc.get_onload().get("e_invoice_info", {}).get("acknowledged_on")
+            )
+            reason = gst_settings.reason_for_e_invoice_cancellation
+
+        else:
+            generated_on = doc.get_onload().get("e_waybill_info", {}).get("created_on")
+            reason = gst_settings.reason_for_e_waybill_cancellation
+
+        if not generated_on or (add_days(generated_on, 1) < get_datetime()):
+            return
+
+        values = frappe._dict(
+            {
+                "irn": doc.irn or "",
+                "reason": reason,
+                "ewaybill": doc.ewaybill or "",
+                "remark": "",
+            }
+        )
+        cancel_func(doc, values)
+
+    if doc.irn and gst_settings.enable_e_invoice and gst_settings.auto_cancel_e_invoice:
+        auto_cancel(_cancel_e_invoice, "e_invoice")
+        return
+
+    if (
+        doc.ewaybill
+        and gst_settings.enable_e_waybill
+        and gst_settings.auto_cancel_e_waybill
+    ):
+        auto_cancel(_cancel_e_waybill, "e_waybill")
 
 
 def is_e_waybill_applicable(doc, gst_settings=None):
@@ -307,7 +383,9 @@ def set_and_validate_advances_with_gst(doc):
         allocated_amount_with_taxes += advance.allocated_amount
 
     excess_allocation = flt(
-        flt(allocated_amount_with_taxes, 2) - (doc.rounded_total or doc.grand_total), 2
+        flt(allocated_amount_with_taxes, 2)
+        - (doc.base_rounded_total or doc.base_grand_total),
+        2,
     )
     if excess_allocation > 0:
         message = _(

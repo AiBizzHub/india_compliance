@@ -11,6 +11,9 @@ from frappe.utils.data import format_date
 from erpnext.controllers.sales_and_purchase_return import make_return_doc
 
 from india_compliance.gst_india.api_classes.base import BASE_URL
+from india_compliance.gst_india.overrides.test_transaction import (
+    create_refund_transaction,
+)
 from india_compliance.gst_india.utils import load_doc
 from india_compliance.gst_india.utils.e_invoice import (
     EInvoiceData,
@@ -39,6 +42,8 @@ class TestEInvoice(FrappeTestCase):
                 "fetch_e_waybill_data": 0,
                 "apply_e_invoice_only_for_selected_companies": 0,
                 "enable_retry_einv_ewb_generation": 1,
+                "auto_cancel_e_invoice": 0,
+                "restrict_cancel_if_e_invoice_final": 0,
             },
         )
         cls.e_invoice_test_data = frappe._dict(
@@ -83,7 +88,9 @@ class TestEInvoice(FrappeTestCase):
     def test_request_data_for_foreign_transactions(self):
         test_data = self.e_invoice_test_data.foreign_transaction
         si = create_sales_invoice(
-            **test_data.get("kwargs"), qty=1000, do_not_submit=True
+            **test_data.get("kwargs"),
+            qty=1000,
+            do_not_submit=True,
         )
         si.update(
             {
@@ -373,6 +380,7 @@ class TestEInvoice(FrappeTestCase):
             rate=7.6,
             is_in_state=True,
             do_not_submit=True,
+            company_address="_Test Indian Registered Company-Billing",
         )
 
         append_item(
@@ -446,6 +454,7 @@ class TestEInvoice(FrappeTestCase):
         si = create_sales_invoice(
             customer_address=test_data.get("kwargs").get("customer_address"),
             shipping_address_name=test_data.get("kwargs").get("shipping_address_name"),
+            company_address=test_data.get("kwargs").get("company_address"),
             is_in_state=True,
         )
 
@@ -550,6 +559,37 @@ class TestEInvoice(FrappeTestCase):
             cancelled_doc,
         )
         self.assertDocumentEqual({"ewaybill": ""}, cancelled_doc)
+
+    @responses.activate
+    def test_auto_cancel_e_invoice(self):
+        """Test for auto cancel e-Invoice on cancellation of Sales Invoice"""
+        frappe.db.set_single_value("GST Settings", "auto_cancel_e_invoice", 1)
+        test_data = self.e_invoice_test_data.get("service_item")
+        si = create_sales_invoice(
+            **test_data.get("kwargs"),
+            is_in_state=True,
+        )
+        test_data.get("response_data").get("result").update(
+            {"AckDt": str(add_to_date(days=-2))}
+        )
+        # Mock response for generating irnFser
+        self._mock_e_invoice_response(data=test_data)
+
+        generate_e_invoice(si.name)
+
+        si_doc = load_doc("Sales Invoice", si.name, "cancel")
+
+        # Assert e-Invoice is not cancellable
+        self.assertRaisesRegex(
+            frappe.exceptions.ValidationError,
+            re.compile(r"^(e-Invoice can only be cancelled.*)$"),
+            validate_if_e_invoice_can_be_cancelled,
+            si_doc,
+        )
+
+        # document sholud be cancelled without any error if e-Invoice is not cancellable
+        si_doc.cancel()
+        frappe.db.set_single_value("GST Settings", "auto_cancel_e_invoice", 0)
 
     @responses.activate
     def test_mark_e_invoice_as_cancelled(self):
@@ -763,7 +803,11 @@ class TestEInvoice(FrappeTestCase):
 
         test_data_with_diff_value = self.e_invoice_test_data.get("duplicate_irn")
 
-        si = create_sales_invoice(rate=1400, is_in_state=True)
+        si = create_sales_invoice(
+            rate=1400,
+            is_in_state=True,
+            company_address="_Test Indian Registered Company-Billing",
+        )
         self._mock_e_invoice_response(data=test_data_with_diff_value)
 
         # Assert if Invoice amount has changed
@@ -773,6 +817,62 @@ class TestEInvoice(FrappeTestCase):
             generate_e_invoice,
             si.name,
         )
+
+    @change_settings("GST Settings", {"enable_overseas_transactions": 1})
+    @change_settings("System Settings", {"currency_precision": 3})
+    def test_refund_transaction_invoice_total(self):
+        """Test for e-Invoice generation for Refund Transaction"""
+
+        si = create_refund_transaction()
+        si.items[0].rate = 100.25
+        si.save()
+
+        data = EInvoiceData(si).get_data()
+
+        self.assertEqual(data.get("ValDtls").get("TotInvVal"), 118.04)
+        self.assertEqual(data.get("ValDtls").get("OthChrg"), 0)
+        self.assertEqual(data.get("ValDtls").get("Discount"), 0)
+        self.assertEqual(data.get("ValDtls").get("IgstVal"), 18.04)
+
+    @responses.activate
+    def test_cancellation_when_e_invoice_not_cancellable(self):
+        """
+        Test that a Sales Invoice cannot be cancelled if the associated e-Invoice is not cancellable configurable as per GST settings.
+        """
+        # Enable Setting
+        frappe.db.set_single_value(
+            "GST Settings", "restrict_cancel_if_e_invoice_final", 1
+        )
+
+        test_data = self.e_invoice_test_data.get("service_item")
+        si = create_sales_invoice(
+            **test_data.get("kwargs"),
+            is_in_state=True,
+        )
+        test_data.get("response_data").get("result").update(
+            {"AckDt": str(add_to_date(days=-2))}
+        )
+
+        # Mock response for generating irn
+        self._mock_e_invoice_response(data=test_data)
+
+        generate_e_invoice(si.name)
+        si.reload()
+
+        self.assertRaisesRegex(
+            frappe.exceptions.ValidationError,
+            re.compile(
+                r"^(This document cannot be cancelled because the associated e-Invoice.*)$"
+            ),
+            si.cancel,
+        )
+
+        # Disable Setting
+        frappe.db.set_single_value(
+            "GST Settings", "restrict_cancel_if_e_invoice_final", 0
+        )
+        si.reload()
+        si.cancel()
 
     def _cancel_e_invoice(self, invoice_no):
         values = frappe._dict(

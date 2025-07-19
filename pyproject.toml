@@ -3,7 +3,7 @@ name = "india_compliance"
 authors = [
     { name = "Resilient Tech", email = "hello@indiacompliance.app" }
 ]
-description = "AiBizzApp ERP app to simplify compliance with Indian Rules and Regulations"
+description = "ERPNext app to simplify compliance with Indian Rules and Regulations"
 readme = "README.md"
 dynamic = ["version"]
 dependencies = [

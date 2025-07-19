@@ -115,6 +115,8 @@ class TestGSTR2a(TestGSTRMixin, FrappeTestCase):
                 "gstr_3b_filled": 1,
                 "gstr_1_filing_date": date(2019, 11, 18),
                 "registration_cancel_date": date(2019, 8, 27),
+                "is_downloaded_from_2a": 1,
+                "is_supplier_return_filed": 1,
             },
             doc,
         )
@@ -162,6 +164,8 @@ class TestGSTR2a(TestGSTRMixin, FrappeTestCase):
                 "gstr_3b_filled": 1,
                 "gstr_1_filing_date": date(2020, 5, 12),
                 "registration_cancel_date": date(2019, 8, 27),
+                "is_downloaded_from_2a": 1,
+                "is_supplier_return_filed": 1,
             },
             doc,
         )
@@ -202,6 +206,8 @@ class TestGSTR2a(TestGSTRMixin, FrappeTestCase):
                     "897ADG56RTY78956HYUG90BNHHIJK453GFTD99845672FDHHHSHGFH4567FG56TR"
                 ),
                 "irn_gen_date": date(2019, 12, 24),
+                "is_downloaded_from_2a": 1,
+                "is_supplier_return_filed": 1,
             },
             doc,
         )
@@ -239,6 +245,8 @@ class TestGSTR2a(TestGSTRMixin, FrappeTestCase):
                 "gstr_3b_filled": 1,
                 "gstr_1_filing_date": date(2019, 11, 18),
                 "registration_cancel_date": date(2019, 8, 27),
+                "is_downloaded_from_2a": 1,
+                "is_supplier_return_filed": 1,
             },
             doc,
         )
@@ -261,6 +269,7 @@ class TestGSTR2a(TestGSTRMixin, FrappeTestCase):
                 "cgst": 20,
                 "sgst": 20,
                 "cess": 20,
+                "is_downloaded_from_2a": 1,
             },
             doc,
         )
@@ -283,6 +292,7 @@ class TestGSTR2a(TestGSTRMixin, FrappeTestCase):
                 "taxable_value": 123.02,
                 "igst": 123.02,
                 "cess": 0.5,
+                "is_downloaded_from_2a": 1,
             },
             doc,
         )
@@ -305,6 +315,7 @@ class TestGSTR2a(TestGSTRMixin, FrappeTestCase):
                 "cgst": 0,
                 "sgst": 0,
                 "cess": 0.5,
+                "is_downloaded_from_2a": 1,
             },
             doc,
         )

@@ -15,7 +15,7 @@ from india_compliance.exceptions import (
     InvalidOTPError,
     OTPRequestedError,
 )
-from india_compliance.gst_india.api_classes.base import BaseAPI, get_public_ip
+from india_compliance.gst_india.api_classes.base import BaseAPI
 from india_compliance.gst_india.utils import merge_dicts, tar_gz_bytes_to_data
 from india_compliance.gst_india.utils.cryptography import (
     aes_decrypt_data,
@@ -27,7 +27,6 @@ from india_compliance.gst_india.utils.cryptography import (
 
 
 def otp_handler(func):
-
     @wraps(func)
     def wrapper(*args, **kwargs):
         try:
@@ -45,18 +44,28 @@ def otp_handler(func):
     return wrapper
 
 
-class PublicCertificate(BaseAPI):
+class StaticResourcesAPI(BaseAPI):
     BASE_PATH = "static"
 
     def get_gstn_public_certificate(self, error_message=None) -> str:
-        response = self.get(endpoint="gstn_g2b_prod_public")
+        response = self.get(endpoint="gstn_public_certificate")
 
-        if response.certificate == self.settings.gstn_public_certificate:
+        if response.message == self.settings.gstn_public_certificate:
             frappe.throw(error_message or _("Public Certificate is already up to date"))
 
-        self.settings.db_set("gstn_public_certificate", response.certificate)
+        self.settings.db_set("gstn_public_certificate", response.message)
 
-        return response.certificate
+        return response.message
+
+    def get_nic_public_key(self, error_message=None) -> str:
+        response = self.get(endpoint="nic_public_key")
+
+        if response.message == self.settings.nic_public_key:
+            frappe.throw(error_message or _("Public Key is already up to date"))
+
+        self.settings.db_set("nic_public_key", response.message)
+
+        return response.message
 
 
 class FilesAPI(BaseAPI):
@@ -254,13 +263,13 @@ class TaxpayerAuthenticate(BaseAPI):
         certificate = self.settings.gstn_public_certificate
 
         if not certificate:
-            certificate = PublicCertificate().get_gstn_public_certificate()
+            certificate = StaticResourcesAPI().get_gstn_public_certificate()
 
         cert = x509.load_pem_x509_certificate(certificate.encode(), default_backend())
         valid_up_to = cert.not_valid_after
 
         if valid_up_to < now_datetime():
-            certificate = PublicCertificate().get_gstn_public_certificate()
+            certificate = StaticResourcesAPI().get_gstn_public_certificate()
 
         return certificate.encode()
 
@@ -313,16 +322,9 @@ class TaxpayerBaseAPI(TaxpayerAuthenticate):
                 "gstin": self.company_gstin,
                 "state-cd": self.company_gstin[:2],
                 "username": self.username,
-                "ip-usr": frappe.cache.hget("public_ip", "public_ip", get_public_ip),
                 "txn": self.generate_request_id(length=32),
             }
         )
-
-    def _fetch_credentials(self, row, require_password=True):
-        self.app_key = row.app_key or self.generate_app_key()
-        self.auth_token = row.auth_token
-        self.session_key = b64decode(row.session_key or "")
-        self.session_expiry = row.session_expiry
 
     def _request(
         self,
@@ -367,9 +369,11 @@ class TaxpayerBaseAPI(TaxpayerAuthenticate):
         return self._request("get", *args, **kwargs, params=params)
 
     def post(self, *args, **kwargs):
+        self.default_log_values.update(update_gstr_action=True)
         return self._request("post", *args, **kwargs)
 
     def put(self, *args, **kwargs):
+        self.default_log_values.update(update_gstr_action=True)
         return self._request("put", *args, **kwargs)
 
     def before_request(self, request_args):
@@ -431,7 +435,7 @@ class TaxpayerBaseAPI(TaxpayerAuthenticate):
 
         # Handle invalid public key
         if response.error_type == "invalid_public_key":
-            PublicCertificate().get_gstn_public_certificate(
+            StaticResourcesAPI().get_gstn_public_certificate(
                 error_message=_(
                     "Looks like Public Key of GSTN used for encryption is Invalid"
                 )
@@ -452,27 +456,14 @@ class TaxpayerBaseAPI(TaxpayerAuthenticate):
 
             return True
 
-    def generate_app_key(self):
-        app_key = self.generate_request_id(length=32)
-        frappe.db.set_value(
-            "GST Credential",
-            {
-                "gstin": self.company_gstin,
-                "username": self.username,
-                "service": "Returns",
-            },
-            {"app_key": app_key},
-        )
+        return False
 
-        return app_key
-
-    def get_files(self, return_period, token, action, endpoint, otp=None):
+    def get_files(self, return_period, token, action, endpoint):
         response = self.get(
             action=action,
             return_period=return_period,
             params={"ret_period": return_period, "token": token},
             endpoint=endpoint,
-            otp=otp,
         )
 
         if response.error_type == "queued":
@@ -491,7 +482,7 @@ class TaxpayerBaseAPI(TaxpayerAuthenticate):
             return
 
         # Dummy request
-        self.get_filing_preference()
+        self.fetch_filing_preference(fy=self.get_fy())
 
         frappe.cache.set_value(
             f"authenticated_gstin:{self.company_gstin}",
@@ -501,10 +492,10 @@ class TaxpayerBaseAPI(TaxpayerAuthenticate):
 
         return
 
-    def get_filing_preference(self):
+    def fetch_filing_preference(self, fy):
         return self.get(
-            action="GETPREF", params={"fy": self.get_fy()}, endpoint="returns"
-        )
+            action="GETPREF", params={"fy": fy}, endpoint="returns"
+        ).response
 
     @staticmethod
     def get_fy():

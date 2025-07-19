@@ -36,6 +36,8 @@ const GSTR1_SubCategory = {
     AT: "Advances Received",
     TXP: "Advances Adjusted",
     HSN: "HSN Summary",
+    HSN_B2B: "HSN Summary - B2B",
+    HSN_B2C: "HSN Summary - B2C",
     DOC_ISSUE: "Document Issued",
 
     SUPECOM_52: "Liable to collect tax u/s 52(TCS)",
@@ -108,17 +110,19 @@ frappe.ui.form.on(DOCTYPE, {
             frm.trigger("company");
         });
 
-        frm.filing_frequency = gst_settings.filing_frequency;
-
         // Set Default Values
         set_default_company_gstin(frm);
         set_options_for_year(frm);
         set_options_for_month_or_quarter(frm);
 
+        if (is_gstr1_api_enabled()) {
+            frm.set_df_property("filing_preference", "read_only", 1);
+        }
+
         frm.__setup_complete = true;
 
         // Setup Listeners
-        frappe.realtime.on("is_not_latest_data", message => {
+        frappe.realtime.on("is_not_latest_gstr1_data", message => {
             const { filters } = message;
 
             const [month_or_quarter, year] =
@@ -143,7 +147,7 @@ frappe.ui.form.on(DOCTYPE, {
             );
         });
 
-        frappe.realtime.on("show_message", message => {
+        frappe.realtime.on("show_missing_gst_credentials_message", message => {
             frappe.msgprint(message);
         });
 
@@ -158,7 +162,7 @@ frappe.ui.form.on(DOCTYPE, {
         });
 
         frappe.realtime.on("gstr1_data_prepared", message => {
-            const { filters } = message;
+            const { filters, error_log } = message;
 
             if (
                 frm.doc.company_gstin !== filters.company_gstin ||
@@ -167,7 +171,25 @@ frappe.ui.form.on(DOCTYPE, {
             )
                 return;
 
-            frm.taxpayer_api_call("generate_gstr1").then(r => {
+            const only_books_data = error_log != undefined;
+            if (error_log) {
+                frappe.msgprint({
+                    message: __(
+                        "Error while preparing GSTR-1 data, please check {0} for more deatils.",
+                        [
+                            `<a href='/app/error-log/${error_log}' class='variant-click'>error log</a>`,
+                        ]
+                    ),
+                    title: "GSTR-1 Download Failed",
+                    indicator: "red",
+                });
+            }
+
+            if (frm.doc.filing_preference != filters.filing_preference) {
+                frm.set_value("filing_preference", filters.filing_preference);
+            }
+
+            frm.taxpayer_api_call("generate_gstr1", { only_books_data }).then(r => {
                 frm.doc.__gst_data = r.message;
                 frm.trigger("load_gstr1_data");
             });
@@ -183,10 +205,18 @@ frappe.ui.form.on(DOCTYPE, {
         frm.set_value("company_gstin", options[0]);
     },
 
-    company_gstin: render_empty_state,
+    company_gstin(frm) {
+        render_empty_state(frm);
+        update_filing_preference(frm);
+    },
+
+    file_nil_gstr1(frm) {
+        frm.gstr1.render_form_actions();
+    },
 
     month_or_quarter(frm) {
         render_empty_state(frm);
+        update_filing_preference(frm);
     },
 
     year(frm) {
@@ -194,8 +224,13 @@ frappe.ui.form.on(DOCTYPE, {
         set_options_for_month_or_quarter(frm);
     },
 
+    filing_preference: render_empty_state,
+
     refresh(frm) {
         frm.disable_save();
+        if (is_gstr1_api_enabled()) {
+            refresh_filing_preference(frm);
+        }
 
         frm.gstr1?.render_form_actions();
 
@@ -204,12 +239,19 @@ frappe.ui.form.on(DOCTYPE, {
             return;
         }
 
+        if (!frm.doc.filing_preference) {
+            frm.doc.filing_preference = frm.doc.__gst_data.filing_preference;
+            frm.refresh_field("filing_preference");
+        }
+
         frm.gstr1.render_indicator();
     },
 
     load_gstr1_data(frm) {
         const data = frm.doc.__gst_data;
         if (!data?.status) return;
+
+        frm.doc.file_nil_gstr1 = data.is_nil;
 
         // Toggle HTML fields
         frm.refresh();
@@ -290,6 +332,7 @@ class GSTR1 {
         }
 
         this.set_output_gst_balances();
+        this.toggle_file_nil_gstr1();
 
         // refresh tabs
         this.TABS.forEach(_tab => {
@@ -344,6 +387,10 @@ class GSTR1 {
                 detailed_view_filters
             );
         });
+    }
+
+    refresh_no_data_message() {
+        this.tabs.filed_tab.tabmanager.refresh_no_data_message();
     }
 
     // RENDER
@@ -461,6 +508,7 @@ class GSTR1 {
 
         // Primary Button
         const actions = {
+            Reset: this.gstr1_action.reset_gstr1_data,
             Generate: this.gstr1_action.generate_gstr1_data,
             Upload: this.gstr1_action.upload_gstr1_data,
             "Proceed to File": this.gstr1_action.proceed_to_file,
@@ -473,6 +521,17 @@ class GSTR1 {
                 Uploaded: "Proceed to File",
                 "Ready to File": "File",
             }[this.status] || "Generate";
+
+        // No need to upload if nil gstr1
+        if (this.frm.doc.__gst_data) {
+            if (this.frm.doc.file_nil_gstr1 != this.frm.doc.__gst_data.is_nil)
+                primary_button_label = "Reset";
+
+            if (this.status == "Not Filed")
+                if (this.frm.doc.file_nil_gstr1)
+                    primary_button_label = "Proceed to File";
+                else primary_button_label = "Upload";
+        }
 
         if (this.status === "Ready to File") {
             this.frm.add_custom_button(__("Mark as Unfiled"), () => {
@@ -648,7 +707,12 @@ class GSTR1 {
     }
 
     filter_detailed_view = async (fieldname, value) => {
-        await this.filter_group.push_new_filter([DOCTYPE, fieldname, "=", value]);
+        await this.filter_group.add_or_remove_filter([
+            DOCTYPE,
+            fieldname,
+            "=",
+            value.trim(),
+        ]);
         this.filter_group.apply();
     };
 
@@ -670,6 +734,21 @@ class GSTR1 {
         if (this.active_view === "Detailed" && this.filter_fields.length)
             this.$wrapper.find(".filter-selector").show();
         else this.$wrapper.find(".filter-selector").hide();
+    }
+
+    toggle_file_nil_gstr1() {
+        if (!this.data || !is_gstr1_api_enabled()) return;
+
+        const has_records = this.data.books_summary?.some(row => row.no_of_records > 0);
+        // Nil return cannot be filed for quarterly M1 and M2
+        const can_file_nil_return =
+            this.frm.doc.filing_preference === "Monthly" ||
+            (this.frm.doc.filing_preference === "Quarterly" &&
+                this.frm.doc.month_or_quarter % 3 === 0);
+
+        if (!has_records && this.data.status != "Filed" && can_file_nil_return)
+            this.frm.set_df_property("file_nil_gstr1", "hidden", 0);
+        else this.frm.set_df_property("file_nil_gstr1", "hidden", 1);
     }
 
     async set_output_gst_balances() {
@@ -720,20 +799,126 @@ class GSTR1 {
     }
 
     async show_suggested_jv_dialog() {
-        if (!frappe.perm.has_perm("Journal Entry")) return;
-
-        const { month_or_quarter, year, company } = this.frm.doc;
-        const { message: je_details } = await frappe.call({
-            method: "india_compliance.gst_india.doctype.gstr_1_beta.gstr_1_beta.get_journal_entries",
-            args: { month_or_quarter, year, company },
-        });
-
-        if (!je_details || !je_details.data) return;
-
-        this.create_journal_entry_dialog(je_details);
+        await this.show_rounding_diff_journal_entry();
+        await this.show_rcm_journal_entry();
     }
 
-    create_journal_entry_dialog(je_details) {
+    async show_rcm_journal_entry() {
+        if (!frappe.perm.has_perm("Journal Entry")) return;
+
+        const { month_or_quarter, year, company, filing_preference } = this.frm.doc;
+        const { message: je_details } = await frappe.call({
+            method: "india_compliance.gst_india.doctype.gstr_1_beta.gstr_1_beta.get_journal_entries",
+            args: { month_or_quarter, year, company, filing_preference },
+        });
+
+        if (!je_details) return;
+
+        return new Promise(resolve => {
+            const remarks = `Reduced Output GST Liability to the extent of Sales Reverse Charge as per GSTR-1 for ${this.frm.doc.month_or_quarter} - ${this.frm.doc.year}`;
+            const dialog = this.create_journal_entry_dialog(je_details, remarks);
+
+            dialog.onhide = () => {
+                resolve();
+            };
+
+            dialog.show();
+        });
+    }
+
+    TAX_TO_ACCOUNT_MAP = {
+        total_igst_amount: "igst_account",
+        total_cgst_amount: "cgst_account",
+        total_sgst_amount: "sgst_account",
+        total_cess_amount: ["cess_account", "cess_non_advol_account"],
+    };
+
+    async show_rounding_diff_journal_entry() {
+        if (!frappe.perm.has_perm("Journal Entry")) return;
+
+        let rounding_difference = this.data.books?.rounding_difference[0];
+        if (!rounding_difference || Object.values(rounding_difference).every(v => !v))
+            return;
+
+        const { month_or_quarter, year, company, filing_preference } = this.frm.doc;
+        const { message: data } = await frappe.call({
+            method: "india_compliance.gst_india.doctype.gstr_1_beta.gstr_1_beta.get_gst_and_round_off_accounts",
+            args: { month_or_quarter, year, company, filing_preference },
+        });
+
+        if (!data) return;
+
+        return new Promise(resolve => {
+            const dialog = this.create_rounding_diff_journal_entry(
+                data.account,
+                data.posting_date
+            );
+
+            if (!dialog) return resolve();
+
+            dialog.onhide = () => {
+                resolve();
+            };
+
+            dialog.show();
+        });
+    }
+
+    create_rounding_diff_journal_entry(account, posting_date) {
+        let rounding_difference = this.data.books?.rounding_difference[0];
+
+        const je_details = {
+            posting_date: posting_date,
+            data: [],
+        };
+
+        const get_account_name = account_field => {
+            if (!Array.isArray(account_field)) return account[account_field];
+            for (const acc of account_field) {
+                if (account[acc]) {
+                    return account[acc];
+                }
+            }
+            return null;
+        };
+
+        let total = 0;
+
+        for (const [tax_field, account_field] of Object.entries(
+            this.TAX_TO_ACCOUNT_MAP
+        )) {
+            let value = rounding_difference[tax_field];
+
+            if (!value) continue;
+
+            let account_name = get_account_name(account_field);
+
+            if (!account_name) continue;
+
+            total += value;
+
+            je_details.data.push({
+                account: account_name,
+                debit_in_account_currency: value > 0 ? value : 0,
+                credit_in_account_currency: value < 0 ? Math.abs(value) : 0,
+            });
+        }
+
+        if (je_details.data.length === 0) return;
+
+        if (total !== 0) {
+            je_details.data.push({
+                account: account.round_off_account,
+                debit_in_account_currency: total < 0 ? Math.abs(total) : 0,
+                credit_in_account_currency: total > 0 ? total : 0,
+            });
+        }
+
+        const remarks = `Rounding Difference in Output GST Liability for ${this.frm.doc.month_or_quarter} - ${this.frm.doc.year}`;
+        return this.create_journal_entry_dialog(je_details, remarks);
+    }
+
+    create_journal_entry_dialog(je_details, remarks) {
         const dialog = new frappe.ui.Dialog({
             title: "Suggested Journal Entry",
             fields: [
@@ -754,7 +939,7 @@ class GSTR1 {
                     fieldtype: "Text",
                     label: "Remarks",
                     read_only: 1,
-                    default: `Reduced Output GST Liability to the extent of Sales Reverse Charge as per GSTR-1 for ${this.frm.doc.month_or_quarter} - ${this.frm.doc.year}`,
+                    default: remarks,
                 },
                 {
                     fieldname: "auto_submit",
@@ -786,7 +971,7 @@ class GSTR1 {
             },
         });
 
-        dialog.show();
+        return dialog;
     }
 
     generate_tax_table(data) {
@@ -856,11 +1041,16 @@ class TabManager {
         this.data = data;
         this.summary = summary_data;
         this.status = status;
+        this.rounding_difference = this.data?.rounding_difference[0];
         this.remove_tab_custom_buttons();
         this.setup_actions();
-        this.datatable.refresh(this.summary);
+        this.datatable.refresh(this.summary, null, this.get_no_data_message());
         this.set_default_title();
         this.set_creation_time_string();
+    }
+
+    refresh_no_data_message() {
+        this.datatable.refresh(null, null, this.get_no_data_message());
     }
 
     refresh_view(view, category, filters) {
@@ -974,7 +1164,7 @@ class TabManager {
                 showTotalRow: true,
                 checkboxColumn: false,
                 treeView: treeView,
-                noDataMessage: this.DEFAULT_NO_DATA_MESSAGE,
+                noDataMessage: this.get_no_data_message(),
                 headerDropdown: [
                     {
                         label: "Collapse All Node",
@@ -1000,7 +1190,6 @@ class TabManager {
                         if (!this.summary) return null;
 
                         const total = this.summary.reduce((acc, row) => {
-                            if (row.indent !== 1) return acc;
                             if (
                                 row.consider_in_total_taxable_value &&
                                 ["no_of_records", "total_taxable_value"].includes(
@@ -1018,10 +1207,15 @@ class TabManager {
                     },
                 },
             },
-            no_data_message: __("No data found"),
+            ...this.get_additional_datatable_config(),
         });
 
         this.setup_datatable_listeners(treeView);
+    }
+
+    get_additional_datatable_config() {
+        // Override this method in subclasses to provide additional configuration
+        return {};
     }
 
     setup_datatable_listeners(isSummaryView) {
@@ -1135,10 +1329,10 @@ class TabManager {
             args[2]?.indent == 0
                 ? `<strong>${value}</strong>`
                 : isDescriptionCell
-                    ? `<a href="#" class="description">
+                ? `<a href="#" class="description">
                     <p style="padding-left: 15px">${value}</p>
                     </a>`
-                    : value;
+                : value;
 
         return value;
     }
@@ -1170,6 +1364,10 @@ class TabManager {
         >
             <i class="fa fa-${icon}"></i>
         </button>`;
+    }
+
+    get_no_data_message() {
+        return this.DEFAULT_NO_DATA_MESSAGE;
     }
 }
 
@@ -1639,12 +1837,34 @@ class BooksTab extends GSTR1_TabManager {
         [GSTR1_SubCategory.AT]: this.get_advances_received_columns,
         [GSTR1_SubCategory.TXP]: this.get_advances_adjusted_columns,
 
-        [GSTR1_SubCategory.HSN]: this.get_hsn_columns,
+        [GSTR1_SubCategory.HSN]: this.get_hsn_columns, // Backwards compatibility
+        [GSTR1_SubCategory.HSN_B2B]: this.get_hsn_columns,
+        [GSTR1_SubCategory.HSN_B2C]: this.get_hsn_columns,
 
         [GSTR1_SubCategory.DOC_ISSUE]: this.get_documents_issued_columns,
     };
 
     DEFAULT_TITLE = "Summary of Books";
+
+    get_additional_datatable_config() {
+        return {
+            additional_total_rows: [
+                {
+                    label: "Rounding Difference",
+                    row_id: "rounding_difference",
+                    label_column: "description",
+                    exclude_columns: ["_rowIndex", "_checkbox", "no_of_records"],
+                    data: () => this.rounding_difference,
+                    show: () => {
+                        if (!this.rounding_difference) return false;
+
+                        return Object.values(this.rounding_difference).some(v => v);
+                    },
+                    css_styles: { "font-weight": "bold" },
+                },
+            ],
+        };
+    }
 
     setup_actions() {
         this.add_tab_custom_button("Download Excel", () =>
@@ -1657,7 +1877,6 @@ class BooksTab extends GSTR1_TabManager {
         data = super.filter_data(data, filters);
         return data.filter(row => row.upload_status !== "Missing in Books");
     }
-
     // ACTIONS
 
     download_books_as_excel() {
@@ -1837,7 +2056,10 @@ class FiledTab extends GSTR1_TabManager {
         [GSTR1_SubCategory.AT]: this.get_advances_received_columns,
         [GSTR1_SubCategory.TXP]: this.get_advances_adjusted_columns,
 
-        [GSTR1_SubCategory.HSN]: this.get_hsn_columns,
+        [GSTR1_SubCategory.HSN]: this.get_hsn_columns, // Backwards compatibility
+        [GSTR1_SubCategory.HSN_B2B]: this.get_hsn_columns,
+        [GSTR1_SubCategory.HSN_B2C]: this.get_hsn_columns,
+
         [GSTR1_SubCategory.DOC_ISSUE]: this.get_documents_issued_columns,
     };
 
@@ -1893,9 +2115,9 @@ class FiledTab extends GSTR1_TabManager {
             const { include_uploaded, delete_missing } = dialog
                 ? dialog.get_values()
                 : {
-                    include_uploaded: true,
-                    delete_missing: false,
-                };
+                      include_uploaded: true,
+                      delete_missing: false,
+                  };
 
             const doc = me.instance.frm.doc;
 
@@ -2093,6 +2315,15 @@ class FiledTab extends GSTR1_TabManager {
             },
         ];
     }
+
+    get_no_data_message() {
+        if (this.instance.data?.is_nil)
+            if (this.status === "Filed")
+                return __("You have filed a Nil GSTR-1 for this period");
+            else return __("You are filing a Nil GSTR-1 for this period");
+
+        return this.DEFAULT_NO_DATA_MESSAGE;
+    }
 }
 
 class UnfiledTab extends FiledTab {
@@ -2111,8 +2342,6 @@ class UnfiledTab extends FiledTab {
 }
 
 class ReconcileTab extends FiledTab {
-    DEFAULT_NO_DATA_MESSAGE = __("No differences found");
-
     set_default_title() {
         if (this.instance.data.status === "Filed")
             this.DEFAULT_TITLE = "Books vs Filed";
@@ -2139,7 +2368,7 @@ class ReconcileTab extends FiledTab {
         });
     }
 
-    get_creation_time_string() { } // pass
+    get_creation_time_string() {} // pass
 
     get_detail_view_column() {
         return [
@@ -2166,6 +2395,10 @@ class ReconcileTab extends FiledTab {
                 width: 150,
             },
         ];
+    }
+
+    get_no_data_message() {
+        return __("No differences found");
     }
 }
 
@@ -2213,8 +2446,8 @@ class ErrorsTab extends TabManager {
         ];
     }
 
-    setup_actions() { }
-    set_creation_time_string() { }
+    setup_actions() {}
+    set_creation_time_string() {}
 
     refresh_data(data) {
         data = data.error_report;
@@ -2395,6 +2628,7 @@ class FileGSTR1Dialog {
 
                 this.update_actions_for_filing(pan);
             },
+            static: true,
         });
 
         // get last used pan
@@ -2434,6 +2668,7 @@ class FileGSTR1Dialog {
             },
         });
 
+        this.filing_dialog.get_close_btn().show();
         this.filing_dialog.show();
     }
 
@@ -2470,10 +2705,18 @@ class FileGSTR1Dialog {
         return `
             <tr>
                 <td>${description}</td>
-                <td style="text-align: right;">${format_currency(liability.total_igst_amount)}</td>
-                <td style="text-align: right;">${format_currency(liability.total_cgst_amount)}</td>
-                <td style="text-align: right;">${format_currency(liability.total_sgst_amount)}</td>
-                <td style="text-align: right;">${format_currency(liability.total_cess_amount)}</td>
+                <td style="text-align: right;">${format_currency(
+                    liability.total_igst_amount
+                )}</td>
+                <td style="text-align: right;">${format_currency(
+                    liability.total_cgst_amount
+                )}</td>
+                <td style="text-align: right;">${format_currency(
+                    liability.total_sgst_amount
+                )}</td>
+                <td style="text-align: right;">${format_currency(
+                    liability.total_cess_amount
+                )}</td>
             </tr>
         `;
     }
@@ -2483,7 +2726,7 @@ class FileGSTR1Dialog {
             this.perform_gstr1_action(
                 "file",
                 r => this.handle_filing_response(r.message),
-                { pan: pan, otp: this.filing_dialog.get_value("otp") }
+                { pan: pan, otp: this.filing_dialog.get_value("otp").trim() }
             );
 
             this.toggle_actions(true);
@@ -2581,8 +2824,7 @@ class GSTR1Action extends FileGSTR1Dialog {
         const draft_invoices = this.frm.gstr1.data.books["Document Issued"]?.filter(
             row => row.draft_count > 0
         );
-        if (!draft_invoices?.length)
-            return upload();
+        if (!draft_invoices?.length) return upload();
 
         frappe.confirm(
             __(
@@ -2602,8 +2844,10 @@ class GSTR1Action extends FileGSTR1Dialog {
             ),
             () => {
                 frappe.show_alert(__("Resetting GSTR-1 data"));
-                this.perform_gstr1_action(action, () =>
-                    this.check_action_status_with_retry(action)
+                this.perform_gstr1_action(
+                    action,
+                    () => this.check_action_status_with_retry(action),
+                    { is_nil_return: this.frm.doc.file_nil_gstr1 }
                 );
             }
         );
@@ -2611,11 +2855,18 @@ class GSTR1Action extends FileGSTR1Dialog {
 
     proceed_to_file() {
         const action = "proceed_to_file";
-        this.perform_gstr1_action(action, r => {
-            // already proceed to file
-            if (r.message) this.handle_proceed_to_file_response(r.message);
-            else this.check_action_status_with_retry(action);
-        });
+        this.frm.gstr1.data.is_nil = this.frm.doc.file_nil_gstr1;
+        this.frm.gstr1.refresh_no_data_message();
+
+        this.perform_gstr1_action(
+            action,
+            r => {
+                // already proceed to file
+                if (r.message) this.handle_proceed_to_file_response(r.message);
+                else this.check_action_status_with_retry(action);
+            },
+            { is_nil_return: this.frm.doc.file_nil_gstr1 }
+        );
     }
 
     async mark_as_unfiled() {
@@ -2846,12 +3097,12 @@ function is_gstr1_api_enabled() {
     return (
         india_compliance.is_api_enabled() &&
         !gst_settings.sandbox_mode &&
-        gst_settings.compare_gstr_1_data
+        gst_settings.enable_gstr_1_api
     );
 }
 
 function patch_set_indicator(frm) {
-    frm.toolbar.set_indicator = function () { };
+    frm.toolbar.set_indicator = function () {};
 }
 
 async function set_default_company_gstin(frm) {
@@ -2870,16 +3121,17 @@ async function set_default_company_gstin(frm) {
     }
 }
 
-function set_options_for_year(frm) {
-    const today = new Date();
-    const current_year = today.getFullYear();
-    const start_year = 2017;
-    const year_range = current_year - start_year + 1;
-    let options = Array.from({ length: year_range }, (_, index) => start_year + index);
-    options = options.reverse().map(year => year.toString());
+function update_filing_preference(frm) {
+    const { month_or_quarter, year, company_gstin } = frm.doc;
+    if (!month_or_quarter || !year || !company_gstin) return;
 
-    frm.get_field("year").set_data(options);
-    frm.set_value("year", current_year.toString());
+    frappe.call({
+        method: "india_compliance.gst_india.doctype.gstr_1_beta.gstr_1_beta.get_filing_preference_from_log",
+        args: { month_or_quarter, year, company_gstin },
+        callback: r => {
+            frm.set_value("filing_preference", r.message || "Monthly");
+        },
+    });
 }
 
 function set_options_for_month_or_quarter(frm) {
@@ -2901,29 +3153,17 @@ function set_options_for_month_or_quarter(frm) {
 
     if (frm.doc.year === current_year) {
         // Options for current year till current month
-        if (frm.filing_frequency === "Monthly")
-            options = india_compliance.MONTH.slice(0, current_month_idx + 1);
-        else {
-            let quarter_idx;
-            if (current_month_idx <= 2) quarter_idx = 1;
-            else if (current_month_idx <= 5) quarter_idx = 2;
-            else if (current_month_idx <= 8) quarter_idx = 3;
-            else quarter_idx = 4;
-
-            options = india_compliance.QUARTER.slice(0, quarter_idx);
-        }
+        options = india_compliance.MONTH.slice(0, current_month_idx + 1);
     } else if (frm.doc.year === "2017") {
         // Options for 2017 from July to December
-        if (frm.filing_frequency === "Monthly")
-            options = india_compliance.MONTH.slice(6);
-        else options = india_compliance.QUARTER.slice(2);
+        options = india_compliance.MONTH.slice(6);
     } else {
-        if (frm.filing_frequency === "Monthly") options = india_compliance.MONTH;
-        else options = india_compliance.QUARTER;
+        options = india_compliance.MONTH;
     }
 
     set_field_options("month_or_quarter", options);
-    if (frm.doc.year === current_year)
+
+    if (frm.doc.year === current_year && options.length > 1)
         // set second last option as default
         frm.set_value("month_or_quarter", options[options.length - 2]);
     // set last option as default
@@ -2945,15 +3185,72 @@ function render_empty_state(frm) {
 }
 
 async function get_net_gst_liability(frm) {
+    const { month_or_quarter, year, company, company_gstin, filing_preference } =
+        frm.doc;
+
     const response = await frappe.call({
         method: "india_compliance.gst_india.doctype.gstr_1_beta.gstr_1_beta.get_net_gst_liability",
         args: {
-            month_or_quarter: frm.doc.month_or_quarter,
-            year: frm.doc.year,
-            company_gstin: frm.doc.company_gstin,
-            company: frm.doc.company,
+            company,
+            company_gstin,
+            month_or_quarter,
+            year,
+            filing_preference,
         },
     });
 
     return response?.message;
+}
+
+function refresh_filing_preference(frm) {
+    // update html/css to show refresh button next to filing preference
+    const $pref_wrapper = $(
+        '[data-fieldname="filing_preference"] .control-value.like-disabled-input'
+    );
+    if (!$pref_wrapper.length) return;
+
+    const text = $pref_wrapper[0]?.textContent.trim();
+    const ref_btn_html = frappe.utils.icon("refresh", "xs", "update-filing-preference");
+
+    $pref_wrapper
+        .empty()
+        .addClass("flex align-center justify-content-between")
+        .append($("<span></span>").text(text))
+        .append(
+            $("<span></span>")
+                .attr("title", "Refresh Filing Preference from GSTN")
+                .html(ref_btn_html)
+        );
+
+    // bind click event
+    frm.$wrapper.find(".update-filing-preference").click(async function (e) {
+        const {
+            filing_preference: old_preference,
+            month_or_quarter,
+            year,
+            company_gstin,
+        } = frm.doc;
+
+        const month = india_compliance.MONTH.indexOf(month_or_quarter) + 1;
+        const period = `${String(month).padStart(2, "0")}${year}`;
+
+        const { message: new_preference } = await taxpayer_api.call({
+            method: "india_compliance.gst_india.utils.gstin_info.get_and_update_filing_preference",
+            args: { gstin: company_gstin, period },
+        });
+
+        if (new_preference === old_preference)
+            return frappe.show_alert(__("No change in filing preference"));
+
+        frappe.show_alert(__("Filing preference updated. Regenerate data."));
+        frm.set_value("filing_preference", new_preference);
+    });
+}
+
+function set_options_for_year(frm) {
+    const { options, current_year } = india_compliance.get_options_for_year(
+        frm.doc.filing_preference
+    );
+    frm.get_field("year").set_data(options);
+    frm.set_value("year", current_year);
 }

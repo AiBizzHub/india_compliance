@@ -1,7 +1,7 @@
 app_name = "india_compliance"
 app_title = "India Compliance"
-app_publisher = "Resilient Tech"
-app_description = "AiBizzApp ERP app to simplify compliance with Indian Rules and Regulations"
+app_publisher = "AiBizzHub"
+app_description = "AiBizzApp app to simplify compliance with Indian Rules and Regulations"
 app_icon = "octicon octicon-file-directory"
 app_color = "grey"
 app_email = "hello@indiacompliance.app"
@@ -371,6 +371,7 @@ jinja = {
         "india_compliance.gst_india.utils.jinja.get_qr_code",
         "india_compliance.gst_india.utils.jinja.get_transport_type",
         "india_compliance.gst_india.utils.jinja.get_transport_mode",
+        "india_compliance.gst_india.utils.jinja.get_e_waybill_document_type",
         "india_compliance.gst_india.utils.jinja.get_ewaybill_barcode",
         "india_compliance.gst_india.utils.jinja.get_e_invoice_item_fields",
         "india_compliance.gst_india.utils.jinja.get_e_invoice_amount_fields",

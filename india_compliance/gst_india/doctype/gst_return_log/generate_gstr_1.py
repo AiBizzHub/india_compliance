@@ -4,16 +4,26 @@ import itertools
 
 import frappe
 from frappe import _, unscrub
-from frappe.utils import flt
+from frappe.utils import flt, sbool
+from frappe.utils.data import getdate
 
 from india_compliance.gst_india.api_classes.taxpayer_returns import GSTR1API
-from india_compliance.gst_india.utils.gstr_1 import GovJsonKey, GSTR1_SubCategory
-from india_compliance.gst_india.utils.gstr_1.__init__ import (
+from india_compliance.gst_india.constants import STATUS_CODE_MAP
+from india_compliance.gst_india.doctype.gstr_action.gstr_action import set_gstr_actions
+from india_compliance.gst_india.utils.gstin_info import get_and_update_filing_preference
+from india_compliance.gst_india.utils.gstr_1 import (
     CATEGORY_SUB_CATEGORY_MAPPING,
+    HSN_BIFURCATION_FROM,
+    PREVIOUS_VERSION,
+    QUARTERLY_KEYS,
     SUBCATEGORIES_NOT_CONSIDERED_IN_TOTAL_TAX,
     SUBCATEGORIES_NOT_CONSIDERED_IN_TOTAL_TAXABLE_VALUE,
+    GovJsonKey,
     GSTR1_Category,
-    GSTR1_DataField,
+)
+from india_compliance.gst_india.utils.gstr_1 import GSTR1_DataField as inv_f
+from india_compliance.gst_india.utils.gstr_1 import (
+    GSTR1_SubCategory,
 )
 from india_compliance.gst_india.utils.gstr_1.gstr_1_download import (
     download_gstr1_json_data,
@@ -23,14 +33,9 @@ from india_compliance.gst_india.utils.gstr_1.gstr_1_json_map import (
     convert_to_internal_data_format,
     summarize_retsum_data,
 )
-
-status_code_map = {
-    "P": "Processed",
-    "PE": "Processed with Errors",
-    "ER": "Error",
-    "IP": "In Progress",
-}
-MAXIMUM_UPLOAD_SIZE = 5200000
+from india_compliance.gst_india.utils.gstr_utils import (
+    publish_action_status_notification,
+)
 
 
 class SummarizeGSTR1:
@@ -42,7 +47,7 @@ class SummarizeGSTR1:
         "total_cess_amount": 0,
     }
 
-    def get_summarized_data(self, data, is_filed=False):
+    def get_summarized_data(self, data, filing_from, is_filed=False):
         """
         Helper function to summarize data for each sub-category
         """
@@ -51,9 +56,9 @@ class SummarizeGSTR1:
 
         subcategory_summary = self.get_subcategory_summary(data)
 
-        return self.get_overall_summary(subcategory_summary)
+        return self.get_overall_summary(subcategory_summary, filing_from)
 
-    def get_overall_summary(self, subcategory_summary):
+    def get_overall_summary(self, subcategory_summary, filing_from):
         """
         Summarize data for each category with subcategories
 
@@ -63,7 +68,8 @@ class SummarizeGSTR1:
         3. Remove category row if no records
         4. Round Values
         """
-        cateogory_summary = []
+        category_summary = []
+
         for category, sub_categories in CATEGORY_SUB_CATEGORY_MAPPING.items():
             # Init category row
             category = category.value
@@ -74,8 +80,12 @@ class SummarizeGSTR1:
                 **self.AMOUNT_FIELDS,
             }
 
-            cateogory_summary.append(summary_row)
+            category_summary.append(summary_row)
             remove_category_row = True
+
+            # Backwards compatibility
+            if (filing_from < HSN_BIFURCATION_FROM) and category in PREVIOUS_VERSION:
+                sub_categories = PREVIOUS_VERSION[category]
 
             for subcategory in sub_categories:
                 # update category row
@@ -90,21 +100,27 @@ class SummarizeGSTR1:
                     summary_row[key] += subcategory_row[key]
 
                 # add subcategory row
-                cateogory_summary.append(subcategory_row)
+                category_summary.append(subcategory_row)
                 remove_category_row = False
 
             if not summary_row["no_of_records"]:
                 summary_row["no_of_records"] = ""
 
             if remove_category_row:
-                cateogory_summary.remove(summary_row)
+                category_summary.remove(summary_row)
+
+        for key in QUARTERLY_KEYS:
+            if key not in subcategory_summary:
+                continue
+
+            category_summary.append(subcategory_summary.get(key))
 
         # Round Values
-        for row in cateogory_summary:
+        for row in category_summary:
             for key, value in row.items():
                 if isinstance(value, (int, float)):
                     row[key] = flt(value, 2)
-        return cateogory_summary
+        return category_summary
 
     def get_subcategory_summary(self, data):
         """
@@ -140,7 +156,11 @@ class SummarizeGSTR1:
                 elif subcategory == GSTR1_SubCategory.DOC_ISSUE.value:
                     self.count_doc_issue_summary(summary_row, row)
 
-                elif subcategory == GSTR1_SubCategory.HSN.value:
+                elif subcategory in (
+                    GSTR1_SubCategory.HSN_B2B.value,
+                    GSTR1_SubCategory.HSN_B2C.value,
+                    GSTR1_SubCategory.HSN.value,  # Backwards compatibility
+                ):
                     self.count_hsn_summary(summary_row)
 
         for subcategory in subcategory_summary.keys():
@@ -150,6 +170,39 @@ class SummarizeGSTR1:
                 summary_row["no_of_records"] = count
 
             summary_row.pop("unique_records")
+
+        # summarize included / excluded docs
+        for key in QUARTERLY_KEYS:
+            if key not in data:
+                continue
+
+            summary_row = subcategory_summary.setdefault(
+                key, self.default_subcategory_summary(frappe.unscrub(key))
+            )
+            summary_row.update(
+                {
+                    "indent": 0,
+                    "consider_in_total_taxable_value": True,
+                    "consider_in_total_tax": True,
+                }
+            )
+
+            for row in data[key]:
+                if (
+                    row.get("sub_category")
+                    in SUBCATEGORIES_NOT_CONSIDERED_IN_TOTAL_TAXABLE_VALUE
+                ):
+                    continue
+
+                for field in self.AMOUNT_FIELDS:
+                    if (
+                        field != "total_taxable_value"
+                        and row.get("sub_category")
+                        in SUBCATEGORIES_NOT_CONSIDERED_IN_TOTAL_TAX
+                    ):
+                        continue
+
+                    summary_row[field] += row.get(field, 0)
 
         return subcategory_summary
 
@@ -186,9 +239,9 @@ class SummarizeGSTR1:
     @staticmethod
     def count_doc_issue_summary(summary_row, data_row):
         summary_row["no_of_records"] += (
-            data_row.get(GSTR1_DataField.TOTAL_COUNT.value, 0)
-            - data_row.get(GSTR1_DataField.CANCELLED_COUNT.value, 0)
-            - data_row.get(GSTR1_DataField.DRAFT_COUNT.value, 0)
+            data_row.get(inv_f.TOTAL_COUNT, 0)
+            - data_row.get(inv_f.CANCELLED_COUNT, 0)
+            - data_row.get(inv_f.DRAFT_COUNT, 0)
         )
 
     @staticmethod
@@ -197,14 +250,14 @@ class SummarizeGSTR1:
 
 
 class ReconcileGSTR1:
-    IGNORED_FIELDS = {GSTR1_DataField.TAX_RATE.value, GSTR1_DataField.DOC_VALUE.value}
+    IGNORED_FIELDS = {inv_f.TAX_RATE, inv_f.DOC_VALUE}
     UNREQUIRED_KEYS = {
-        GSTR1_DataField.TRANSACTION_TYPE.value,
-        GSTR1_DataField.DOC_NUMBER.value,
-        GSTR1_DataField.DOC_DATE.value,
-        GSTR1_DataField.CUST_GSTIN.value,
-        GSTR1_DataField.CUST_NAME.value,
-        GSTR1_DataField.REVERSE_CHARGE.value,
+        inv_f.TRANSACTION_TYPE,
+        inv_f.DOC_NUMBER,
+        inv_f.DOC_DATE,
+        inv_f.CUST_GSTIN,
+        inv_f.CUST_NAME,
+        inv_f.REVERSE_CHARGE,
     }
 
     def get_reconcile_gstr1_data(self, gov_data, books_data):
@@ -425,7 +478,7 @@ class ReconcileGSTR1:
 
 
 class AggregateInvoices:
-    IGNORED_FIELDS = {GSTR1_DataField.TAX_RATE.value, GSTR1_DataField.DOC_VALUE.value}
+    IGNORED_FIELDS = {inv_f.TAX_RATE, inv_f.DOC_VALUE}
 
     @staticmethod
     def get_aggregate_data(data: dict):
@@ -513,6 +566,9 @@ class GenerateGSTR1(SummarizeGSTR1, ReconcileGSTR1, AggregateInvoices):
 
         data = data
         data["status"] = self.filing_status or "Not Filed"
+        data["is_nil"] = self.is_nil
+        data["filing_preference"] = self.filing_preference
+
         if error_data := self.get_json_for("upload_error"):
             data["errors"] = error_data
 
@@ -544,19 +600,38 @@ class GenerateGSTR1(SummarizeGSTR1, ReconcileGSTR1, AggregateInvoices):
         data = {}
 
         # APIs Disabled
-        if not self.is_gstr1_api_enabled(warn_for_missing_credentials=True):
+        settings = frappe.get_cached_doc("GST Settings")
+        if not settings.is_gstr1_api_enabled(
+            self.gstin, warn_for_missing_credentials=True
+        ):
             return self.generate_only_books_data(data, filters, callback)
 
         # APIs Enabled
         status = self.get_return_status()
+
+        self.set_filing_preference()
 
         if status == "Filed":
             gov_data_field = "filed"
         else:
             gov_data_field = "unfiled"
 
+        if status != "Filed" and settings.compare_unfiled_data != 1:
+            return self.generate_only_books_data(data, filters, callback)
+
         # Get Data
-        gov_data, is_enqueued = self.get_gov_gstr1_data()
+        try:
+            gov_data, is_enqueued = self.get_gov_gstr1_data()
+        except frappe.ValidationError as error:
+            self.generate_only_books_data(data, filters)
+            self.update_status("Failed", commit=True)
+
+            error_log = frappe.log_error(
+                title="GSTR-1 Generation Failed",
+                message=str(error),
+                reference_doctype="GSTR-1 Beta",
+            )
+            return callback and callback(filters, error_log.name)
 
         books_data = self.get_books_gstr1_data(filters)
 
@@ -576,8 +651,20 @@ class GenerateGSTR1(SummarizeGSTR1, ReconcileGSTR1, AggregateInvoices):
         data[gov_data_field] = self.normalize_data(gov_data)
         data["books"] = self.normalize_data(books_data)
 
-        self.summarize_data(data)
+        self.summarize_data(data, filters)
         return callback and callback(filters)
+
+    def set_filing_preference(self):
+        """
+        Args:
+            filters (dict): Filters containing month_or_quarter and filing_preference.
+            status (str): The current filing status.
+        """
+
+        if not self.get("filing_preference"):
+            self.filing_preference = get_and_update_filing_preference(
+                self.gstin, self.return_period
+            )
 
     def generate_only_books_data(self, data, filters, callback=None):
         status = "Not Filed"
@@ -587,7 +674,8 @@ class GenerateGSTR1(SummarizeGSTR1, ReconcileGSTR1, AggregateInvoices):
         data["books"] = self.normalize_data(books_data)
         data["status"] = status
 
-        self.summarize_data(data)
+        self.summarize_data(data, filters)
+
         return callback and callback(filters)
 
     # GET DATA
@@ -623,15 +711,15 @@ class GenerateGSTR1(SummarizeGSTR1, ReconcileGSTR1, AggregateInvoices):
                 return books_data
 
         from_date, to_date = get_gstr_1_from_and_to_date(
-            filters.month_or_quarter, filters.year
+            filters.month_or_quarter, filters.year, self.filing_preference
         )
 
         _filters = frappe._dict(
             {
-                "company": filters.company,
-                "company_gstin": filters.company_gstin,
                 "from_date": from_date,
                 "to_date": to_date,
+                "filing_preference": self.filing_preference,
+                **filters,
             }
         )
 
@@ -645,7 +733,7 @@ class GenerateGSTR1(SummarizeGSTR1, ReconcileGSTR1, AggregateInvoices):
         return books_data
 
     # DATA MODIFIERS
-    def summarize_data(self, data):
+    def summarize_data(self, data, filters):
         """
         Summarize data for all fields => reconcile, filed, unfiled, books
 
@@ -653,8 +741,8 @@ class GenerateGSTR1(SummarizeGSTR1, ReconcileGSTR1, AggregateInvoices):
         Else, summarize the data and save it.
         """
         summary_fields = {
-            "reconcile": "reconcile_summary",
             "filed": "filed_summary",
+            "reconcile": "reconcile_summary",
             "unfiled": "unfiled_summary",
             "books": "books_summary",
         }
@@ -673,9 +761,15 @@ class GenerateGSTR1(SummarizeGSTR1, ReconcileGSTR1, AggregateInvoices):
                     data[field] = _data
                     continue
 
+            filing_from = getdate(f"01-{filters.month_or_quarter}-{filters.year}")
             summary_data = self.get_summarized_data(
-                data[key], self.filing_status == "Filed"
+                data[key], filing_from, self.filing_status == "Filed"
             )
+
+            if key == "reconcile":
+                amendment_row = self.get_net_liability_from_amendments()
+                if amendment_row:
+                    summary_data.append(amendment_row)
 
             self.update_json_for(field, summary_data)
             data[field] = summary_data
@@ -706,18 +800,40 @@ class GenerateGSTR1(SummarizeGSTR1, ReconcileGSTR1, AggregateInvoices):
 
         return data
 
+    def get_net_liability_from_amendments(self):
+        if not (
+            self.filed_summary and (filed_summary := self.get_json_for("filed_summary"))
+        ):
+            return
+
+        amendment_row = None
+        for row in filed_summary:
+            if row.get("description") == "Net Liability from Amendments":
+                amendment_row = row
+                break
+
+        if not amendment_row:
+            return
+
+        for key, value in amendment_row.items():
+            if key in self.AMOUNT_FIELDS:
+                amendment_row[key] = -value
+
+        return amendment_row
+
 
 class FileGSTR1:
-    def reset_gstr1(self, force):
+    def reset_gstr1(self, is_nil_return, force):
         verify_request_in_progress(self, force)
 
         # reset called after proceed to file
         self.db_set({"filing_status": "Not Filed"})
+        self.db_set({"is_nil": sbool(is_nil_return)})
 
         api = GSTR1API(self)
         response = api.reset_gstr_1_data(self.return_period)
 
-        set_gstr1_actions(self, "reset", response.get("reference_id"), api.request_id)
+        set_gstr_actions(self, "reset", response.get("reference_id"), api.request_id)
 
     def process_reset_gstr1(self):
         if not self.actions:
@@ -734,8 +850,9 @@ class FileGSTR1:
         response = api.get_return_status(self.return_period, doc.token)
 
         if response.get("status_cd") != "IP":
-            doc.db_set({"status": status_code_map.get(response.get("status_cd"))})
-            enqueue_notification(
+            doc.db_set({"status": STATUS_CODE_MAP.get(response.get("status_cd"))})
+            publish_action_status_notification(
+                "GSTR-1",
                 self.return_period,
                 "reset",
                 response.get("status_cd"),
@@ -768,7 +885,7 @@ class FileGSTR1:
         api = GSTR1API(self)
         response = api.save_gstr_1_data(self.return_period, json_data)
 
-        set_gstr1_actions(self, "upload", response.get("reference_id"), api.request_id)
+        set_gstr_actions(self, "upload", response.get("reference_id"), api.request_id)
 
     def process_upload_gstr1(self):
         if not self.actions:
@@ -786,8 +903,9 @@ class FileGSTR1:
         status_cd = response.get("status_cd")
 
         if status_cd != "IP":
-            doc.db_set({"status": status_code_map.get(status_cd)})
-            enqueue_notification(
+            doc.db_set({"status": STATUS_CODE_MAP.get(status_cd)})
+            publish_action_status_notification(
+                "GSTR-1",
                 self.return_period,
                 "upload",
                 status_cd,
@@ -812,17 +930,26 @@ class FileGSTR1:
 
         return response
 
-    def proceed_to_file_gstr1(self, force):
+    def proceed_to_file_gstr1(self, is_nil_return, force):
         verify_request_in_progress(self, force)
 
+        is_nil_return = sbool(is_nil_return)
+
         api = GSTR1API(self)
-        response = api.proceed_to_file("GSTR1", self.return_period)
+        response = api.proceed_to_file("GSTR1", self.return_period, is_nil_return)
 
         # Return Form already ready to be filed
-        if response.error and response.error.error_cd == "RET00003":
+        if response.error and response.error.error_cd == "RET00003" or is_nil_return:
+            set_gstr_actions(
+                self,
+                "proceed_to_file",
+                response.get("reference_id"),
+                api.request_id,
+                status="Processed",
+            )
             return self.fetch_and_compare_summary(api)
 
-        set_gstr1_actions(
+        set_gstr_actions(
             self, "proceed_to_file", response.get("reference_id"), api.request_id
         )
 
@@ -843,7 +970,7 @@ class FileGSTR1:
         if response.get("status_cd") == "IP":
             return response
 
-        doc.db_set({"status": status_code_map.get(response.get("status_cd"))})
+        doc.db_set({"status": STATUS_CODE_MAP.get(response.get("status_cd"))})
 
         return self.fetch_and_compare_summary(api, response)
 
@@ -852,13 +979,15 @@ class FileGSTR1:
             response = {}
 
         summary = api.get_gstr_1_data("RETSUM", self.return_period)
+        self.db_set("is_nil", summary.isnil == "Y")
+
         if summary.error:
             return
 
         self.update_json_for("authenticated_summary", summary)
 
         mapped_summary = self.get_json_for("books_summary")
-        gov_summary = convert_to_internal_data_format(summary).get("summary")
+        gov_summary = convert_to_internal_data_format(summary).get("summary", {})
         gov_summary = summarize_retsum_data(gov_summary.values())
 
         differing_categories = get_differing_categories(mapped_summary, gov_summary)
@@ -875,7 +1004,8 @@ class FileGSTR1:
                     "differing_categories": differing_categories,
                 }
             )
-            enqueue_notification(
+            publish_action_status_notification(
+                "GSTR-1",
                 self.return_period,
                 "proceed_to_file",
                 response.get("status_cd"),
@@ -907,7 +1037,7 @@ class FileGSTR1:
                 }
             )
 
-            set_gstr1_actions(
+            set_gstr_actions(
                 self,
                 "file",
                 response.get("ack_num"),
@@ -920,7 +1050,7 @@ class FileGSTR1:
     def get_amendment_data(self):
         authenticated_summary = convert_to_internal_data_format(
             self.get_json_for("authenticated_summary")
-        ).get("summary")
+        ).get("summary", {})
         authenticated_summary = summarize_retsum_data(authenticated_summary.values())
 
         non_amended_entries = {
@@ -986,7 +1116,10 @@ def get_differing_categories(mapped_summary, gov_summary):
         },
     }
 
-    IGNORED_CATEGORIES = {"Net Liability from Amendments"}
+    IGNORED_CATEGORIES = {
+        "Net Liability from Amendments",
+        *[frappe.unscrub(key) for key in QUARTERLY_KEYS],
+    }
 
     gov_summary = {row["description"]: row for row in gov_summary if row["indent"] == 0}
     compared_categories = set()
@@ -1028,85 +1161,3 @@ def get_differing_categories(mapped_summary, gov_summary):
                 break
 
     return differing_categories
-
-
-def set_gstr1_actions(doc, request_type, token, request_id, status=None):
-    if not token:
-        return
-
-    row = {
-        "request_type": request_type,
-        "token": token,
-        "creation_time": frappe.utils.now_datetime(),
-    }
-
-    if status:
-        row["status"] = status
-
-    doc.append("actions", row)
-    doc.save()
-    enqueue_link_integration_request(token, request_id)
-
-
-def enqueue_link_integration_request(token, request_id):
-    """
-    Integration request is enqueued. Hence, it's name is not available immediately.
-    Hence, link it after the request is processed.
-    """
-    frappe.enqueue(
-        link_integration_request, queue="long", token=token, request_id=request_id
-    )
-
-
-def link_integration_request(token, request_id):
-    doc_name = frappe.db.get_value("Integration Request", {"request_id": request_id})
-    if doc_name:
-        frappe.db.set_value(
-            "GSTR Action", {"token": token}, {"integration_request": doc_name}
-        )
-
-
-def enqueue_notification(
-    return_period, request_type, status_cd, gstin, request_id=None
-):
-    frappe.enqueue(
-        create_notification,
-        queue="long",
-        return_period=return_period,
-        request_type=request_type,
-        status_cd=status_cd,
-        gstin=gstin,
-        request_id=request_id,
-    )
-
-
-def create_notification(return_period, request_type, status_cd, gstin, request_id=None):
-    # request_id shows failure response
-    status_message_map = {
-        "P": f"Data {request_type} for GSTIN {gstin} and return period {return_period} has been successfully completed.",
-        "PE": f"Data {request_type} for GSTIN {gstin} and return period {return_period} is completed with errors",
-        "ER": f"Data {request_type} for GSTIN {gstin} and return period {return_period} has encountered errors",
-    }
-
-    if request_id and (
-        doc_name := frappe.db.get_value(
-            "Integration Request", {"request_id": request_id}
-        )
-    ):
-        document_type = "Integration Request"
-        document_name = doc_name
-    else:
-        document_type = document_name = "GSTR-1 Beta"
-
-    notification = frappe.get_doc(
-        {
-            "doctype": "Notification Log",
-            "for_user": frappe.session.user,
-            "type": "Alert",
-            "document_type": document_type,
-            "document_name": document_name,
-            "subject": f"Data {request_type} for GSTIN {gstin} and return period {return_period}",
-            "email_content": status_message_map.get(status_cd),
-        }
-    )
-    notification.insert()

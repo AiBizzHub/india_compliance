@@ -74,20 +74,19 @@ frappe.ui.form.on(DOCTYPE, {
 
     on_submit: function (frm) {
         if (!frm._inward_supply) return;
-
         // go back to previous page and match the invoice with the inward supply
         setTimeout(() => {
-            frappe.route_hooks.after_load = reco_frm => {
-                if (!reco_frm.purchase_reconciliation_tool) return;
-                purchase_reconciliation_tool.link_documents(
-                    reco_frm,
+            frappe.route_hooks.after_load = source_frm => {
+                if (!source_frm.reconciliation_tabs) return;
+                reconciliation.link_documents(
+                    source_frm,
                     frm.doc.name,
                     frm._inward_supply.name,
                     "Purchase Invoice",
                     false
                 );
             };
-            frappe.set_route("Form", "Purchase Reconciliation Tool");
+            frappe.set_route("Form", frm._inward_supply.source_doc);
         }, 2000);
     },
 });
@@ -107,7 +106,12 @@ function toggle_reverse_charge(frm) {
     let is_read_only = 0;
     if (frm.doc.gst_category !== "Overseas") is_read_only = 0;
     // has_goods_item
-    else if (frm.doc.items.some(item => !item.gst_hsn_code.startsWith("99")))
+    else if (
+        frm.doc.items.length > 0 &&
+        frm.doc.items.some(
+            item => item.gst_hsn_code && !item.gst_hsn_code.startsWith("99")
+        )
+    )
         is_read_only = 1;
 
     frm.set_df_property("is_reverse_charge", "read_only", is_read_only);
@@ -116,7 +120,7 @@ function toggle_reverse_charge(frm) {
 function validate_gst_hsn_code(frm) {
     if (frm.doc.gst_category !== "Overseas") return;
 
-    if (frm.doc.items.some(item => !item.gst_hsn_code)) {
+    if (frm.doc.items.some(item => item.item_name && !item.gst_hsn_code)) {
         frappe.throw(__("GST HSN Code is mandatory for Overseas Purchase Invoice."));
     }
 }
